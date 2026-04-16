@@ -4,12 +4,13 @@ pipeline {
     
     tools {
         maven 'Maven'
-        jdk 'JDK17'
+        jdk 'JDK11'
     }
     
     environment {
         APP_NAME = 'jenkins-demo-app'
         APP_VERSION = '1.0.0'
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
     }
     
     stages {
@@ -28,45 +29,45 @@ pipeline {
             }
         }
         
-        stage('Unit Tests') {
-            steps {
-                echo 'Running unit tests with code coverage...'
-                sh 'mvn test jacoco:report'
-                echo 'Unit tests completed successfully!'
-            }
-            post {
-                always {
-                    junit 'target/surefire-reports/*.xml'
-                    publishHTML([
-                        allowMissing: false,
-                        alwaysLinkToLastBuild: true,
-                        keepAll: true,
-                        reportDir: 'target/site/jacoco',
-                        reportFiles: 'index.html',
-                        reportName: 'Code Coverage Report'
-                    ])
-                    echo 'Test results and coverage report published'
+        stage('Parallel Testing') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        echo 'Running unit tests with code coverage...'
+                        sh 'mvn test jacoco:report'
+                        echo 'Unit tests completed successfully!'
+                    }
+                    post {
+                        always {
+                            junit 'target/surefire-reports/*.xml'
+                            publishHTML([
+                                allowMissing: false,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'target/site/jacoco',
+                                reportFiles: 'index.html',
+                                reportName: 'Code Coverage Report'
+                            ])
+                        }
+                    }
                 }
-            }
-        }
-        
-        stage('Code Quality Check') {
-            steps {
-                echo 'Performing code quality checks...'
-                sh '''
-                    echo "Checking for compilation warnings..."
-                    mvn compile 2>&1 | grep -i warning || echo "No compilation warnings found"
-                    
-                    echo "Checking test coverage threshold..."
-                    COVERAGE=$(grep -o 'Total.*[0-9]*%' target/site/jacoco/index.html | grep -o '[0-9]*%' | head -1 | sed 's/%//')
-                    echo "Code coverage: ${COVERAGE}%"
-                    if [ "$COVERAGE" -lt 50 ]; then
-                        echo "Warning: Code coverage is below 50%"
-                    else
-                        echo "Code coverage meets minimum threshold"
-                    fi
-                '''
-                echo 'Code quality check completed!'
+                
+                stage('Code Quality Check') {
+                    steps {
+                        echo 'Performing code quality checks...'
+                        sh '''
+                            echo "Checking for compilation warnings..."
+                            mvn compile 2>&1 | grep -i warning || echo "No compilation warnings found"
+                            
+                            echo "Checking code style..."
+                            find src -name "*.java" -exec wc -l {} + | tail -1 | awk '{print "Total lines of code: " $1}'
+                            
+                            echo "Checking for TODO comments..."
+                            grep -r "TODO" src/ || echo "No TODO comments found"
+                        '''
+                        echo 'Code quality check completed!'
+                    }
+                }
             }
         }
         
@@ -89,9 +90,7 @@ pipeline {
                 echo 'Running integration tests...'
                 sh '''
                     echo "Starting application for integration testing..."
-                    java -jar target/${APP_NAME}-${APP_VERSION}.jar > app.log 2>&1 &
-                    APP_PID=$!
-                    sleep 2
+                    timeout 10s java -jar target/${APP_NAME}-${APP_VERSION}.jar > app.log 2>&1 || true
                     
                     echo "Running integration test scenarios..."
                     echo "Test 1: Application startup verification"
@@ -99,7 +98,6 @@ pipeline {
                         echo "✓ Application started successfully"
                     else
                         echo "✗ Application startup failed"
-                        kill $APP_PID 2>/dev/null || true
                         exit 1
                     fi
                     
@@ -108,30 +106,38 @@ pipeline {
                         echo "✓ Version information correct"
                     else
                         echo "✗ Version information missing or incorrect"
-                        kill $APP_PID 2>/dev/null || true
                         exit 1
                     fi
-                    
-                    echo "Stopping application..."
-                    kill $APP_PID 2>/dev/null || true
-                    sleep 1
                 '''
                 echo 'Integration tests completed successfully!'
             }
         }
         
         stage('Deploy') {
+            when {
+                branch 'master'
+            }
             steps {
                 echo 'Deploying application...'
                 sh '''
                     echo "Deployment simulation - copying JAR to deployment directory"
                     mkdir -p deployment
-                    cp target/${APP_NAME}-${APP_VERSION}.jar deployment/
-                    echo "Application deployed to deployment directory"
+                    cp target/${APP_NAME}-${APP_VERSION}.jar deployment/${APP_NAME}-${APP_VERSION}-build-${BUILD_NUMBER}.jar
+                    echo "Application deployed as ${APP_NAME}-${APP_VERSION}-build-${BUILD_NUMBER}.jar"
+                    
+                    echo "Creating deployment manifest..."
+                    cat > deployment/manifest.txt << EOL
+Application: ${APP_NAME}
+Version: ${APP_VERSION}
+Build: ${BUILD_NUMBER}
+Deployed: $(date)
+JAR File: ${APP_NAME}-${APP_VERSION}-build-${BUILD_NUMBER}.jar
+EOL
                     
                     echo "Verifying deployment..."
-                    if [ -f "deployment/${APP_NAME}-${APP_VERSION}.jar" ]; then
+                    if [ -f "deployment/${APP_NAME}-${APP_VERSION}-build-${BUILD_NUMBER}.jar" ]; then
                         echo "✓ Deployment verification successful"
+                        cat deployment/manifest.txt
                     else
                         echo "✗ Deployment verification failed"
                         exit 1
@@ -150,12 +156,13 @@ pipeline {
         }
         success {
             echo '🎉 Pipeline executed successfully!'
-            echo 'All stages completed: Checkout → Build → Test → Quality Check → Package → Integration Test → Deploy'
+            echo "Build #${BUILD_NUMBER} completed successfully"
+            echo 'All stages completed: Checkout → Build → Parallel Testing → Package → Integration Test → Deploy'
         }
         failure {
             echo '❌ Pipeline execution failed!'
+            echo "Build #${BUILD_NUMBER} failed"
             echo 'Check the logs above to identify the failing stage'
         }
     }
 }
-
